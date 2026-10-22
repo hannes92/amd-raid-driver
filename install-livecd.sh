@@ -97,7 +97,7 @@ case "$FAMILY" in
         ;;
     fedora)
         dnf install -y \
-            gcc make "kernel-devel-$(uname -r)" "kernel-headers-$(uname -r)" \
+            gcc make "kernel-devel-$(uname -r)" \
             dkms pciutils \
             | sed 's/^/    /'
         ;;
@@ -134,6 +134,13 @@ for bdf in $MEMBER_BDFS; do
         echo "$bdf" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null || true
     fi
 done
+
+# A re-run in the same live session finds rcraid already loaded (and the
+# members already pinned, which detect_members picks up); reload so the
+# freshly built module is the one serving the OS installer.
+if grep -q '^rcraid ' /proc/modules; then
+    rmmod rcraid || { echo "rcraid is loaded and busy — unmount /dev/rcraid0* first" >&2; exit 1; }
+fi
 
 insmod "$SRC_DIR/rcraid.ko" \
     enable_writes=1 "$(member_filter_option)" 2>&1 \
@@ -235,28 +242,41 @@ echo "==> [6/8] locating the target rootfs on /dev/rcraid0"
 
 # Probe each partition read-only and find the one that looks like a Linux root
 # (has /etc/os-release or /usr/lib/os-release).  Skip swap, EFI, etc.
+#
+# btrfs installs put / in a subvolume rather than the top level (Fedora
+# Workstation: "root", Ubuntu: "@"), so on btrfs also look one directory
+# down and remember the subvolume for the real mount.
 PROBE_DIR=$(mktemp -d)
 TARGET_PART=""
+TARGET_SUBVOL=""
 for part in /dev/rcraid0p*; do
     [ -b "$part" ] || continue
-    if mount -o ro "$part" "$PROBE_DIR" 2>/dev/null; then
-        if [ -e "$PROBE_DIR/etc/os-release" ] || \
-           [ -e "$PROBE_DIR/usr/lib/os-release" ]; then
-            TARGET_PART="$part"
-            # Note target's distro for the chroot install commands.  Parse
-            # os-release instead of sourcing it: we're root and the file
-            # comes from a just-written target disk — never execute it.
-            if [ -e "$PROBE_DIR/etc/os-release" ]; then
-                osrel="$PROBE_DIR/etc/os-release"
-            else
-                osrel="$PROBE_DIR/usr/lib/os-release"
-            fi
-            target_os=$(awk -F= '$1 == "ID" {gsub(/["'\'']/, "", $2); print $2; exit}' "$osrel")
-            umount "$PROBE_DIR"
-            break
-        fi
-        umount "$PROBE_DIR"
+    mount -o ro "$part" "$PROBE_DIR" 2>/dev/null || continue
+    roots=("$PROBE_DIR")
+    if [ "$(blkid -o value -s TYPE "$part" 2>/dev/null || true)" = btrfs ]; then
+        for d in "$PROBE_DIR"/*/; do
+            [ -d "$d" ] && roots+=("${d%/}")
+        done
     fi
+    for root in "${roots[@]}"; do
+        if [ -e "$root/etc/os-release" ]; then
+            osrel="$root/etc/os-release"
+        elif [ -e "$root/usr/lib/os-release" ]; then
+            osrel="$root/usr/lib/os-release"
+        else
+            continue
+        fi
+        TARGET_PART="$part"
+        TARGET_SUBVOL="${root#"$PROBE_DIR"}"
+        TARGET_SUBVOL="${TARGET_SUBVOL#/}"
+        # Note target's distro for the chroot install commands.  Parse
+        # os-release instead of sourcing it: we're root and the file
+        # comes from a just-written target disk — never execute it.
+        target_os=$(awk -F= '$1 == "ID" {gsub(/["'\'']/, "", $2); print $2; exit}' "$osrel")
+        break
+    done
+    umount "$PROBE_DIR"
+    [ -n "$TARGET_PART" ] && break
 done
 rmdir "$PROBE_DIR"
 
@@ -273,13 +293,13 @@ case "$target_os" in
        TARGET_FAMILY="$FAMILY" ;;
 esac
 
-echo "    found rootfs: $TARGET_PART ($target_os, $TARGET_FAMILY family)"
+echo "    found rootfs: $TARGET_PART${TARGET_SUBVOL:+ (btrfs subvol $TARGET_SUBVOL)} ($target_os, $TARGET_FAMILY family)"
 
 # Mount target rootfs + bind /dev /proc /sys + auto-mount /boot and /boot/efi
 # from the target's fstab if they're separate partitions.
 TARGET=/mnt/rcraid-target
 mkdir -p "$TARGET"
-mount "$TARGET_PART" "$TARGET"
+mount ${TARGET_SUBVOL:+-o "subvol=$TARGET_SUBVOL"} "$TARGET_PART" "$TARGET"
 
 trap 'umount -R "$TARGET" 2>/dev/null || true' EXIT
 
@@ -393,7 +413,7 @@ case "\$TARGET_FAMILY" in
     fedora)
         hdr_pkgs=()
         for kver in \$TARGET_KVERS; do
-            hdr_pkgs+=("kernel-devel-\$kver" "kernel-headers-\$kver")
+            hdr_pkgs+=("kernel-devel-\$kver")
         done
         dnf install -y gcc make "\${hdr_pkgs[@]}" dkms dracut
         ;;
@@ -444,6 +464,15 @@ elif command -v update-initramfs >/dev/null 2>&1; then
 else
     echo "ERROR: no initramfs generator in target — boot-from-RAID will fail" >&2
     exit 1
+fi
+
+# SELinux targets (Fedora/RHEL): give everything laid down by hand the
+# target policy's labels, so udev may execute rcraid-bind after boot.
+if command -v restorecon >/dev/null 2>&1 && [ -e /etc/selinux/config ]; then
+    echo "    restoring SELinux labels"
+    restorecon -RF /usr/sbin/rcraid-bind /etc/udev/rules.d/50-rcraid.rules \\
+        /etc/modprobe.d/rcraid.conf /usr/lib/dracut/modules.d/95rcraid \\
+        "\$SRC_DIR" /lib/modules /boot 2>/dev/null || true
 fi
 EOF
 chmod +x "$TARGET/tmp/rcraid-in-target.sh"
