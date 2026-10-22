@@ -104,62 +104,15 @@ case "$FAMILY" in
 esac
 echo
 
-# Auto-detect array members by subsystem_vendor (the AMD chipset shadows every
-# downstream NVMe as 1022:b000, including the live USB stick on some boards,
-# so we filter by subsys vendor).  Heuristic: pick the vendor with >= 2
-# devices; if there's a tie, ask the user.
+# Auto-detect array members: by subsystem_vendor on 1022:b000 platforms (the
+# AMD chipset shadows every downstream NVMe as 1022:b000, including the live
+# USB stick on some boards), by RAIDCore metadata on X399 (members keep their
+# native NVMe IDs).  See scripts/lib/members.sh.
 echo "==> [2/8] detecting array members"
-declare -A vendor_count
-declare -A vendor_bdfs
-while read -r bdf; do
-    [ -n "$bdf" ] || continue
-    sv=$(cat "/sys/bus/pci/devices/$bdf/subsystem_vendor")
-    vendor_count[$sv]=$((${vendor_count[$sv]:-0} + 1))
-    vendor_bdfs[$sv]="${vendor_bdfs[$sv]:-} $bdf"
-done < <(lspci -d 1022:b000 -D | awk '{print $1}')
-
-if [ ${#vendor_count[@]} -eq 0 ]; then
-    echo "No PCI 1022:b000 devices found." >&2
-    echo "Make sure your BIOS is in RAID mode and the array is created." >&2
-    exit 1
-fi
-
-candidates=()
-for sv in "${!vendor_count[@]}"; do
-    if [ "${vendor_count[$sv]}" -ge 2 ]; then
-        candidates+=("$sv")
-    fi
-done
-
-if [ ${#candidates[@]} -eq 0 ]; then
-    echo "Found 1022:b000 devices but no vendor has >= 2 (no array detected):" >&2
-    for sv in "${!vendor_count[@]}"; do
-        echo "  subsystem_vendor $sv → ${vendor_bdfs[$sv]}" >&2
-    done
-    exit 1
-elif [ ${#candidates[@]} -eq 1 ]; then
-    SUBSYSTEM_VENDOR="${candidates[0]}"
-else
-    echo "Multiple candidate arrays detected:"
-    i=1
-    for sv in "${candidates[@]}"; do
-        echo "  [$i] subsystem_vendor $sv → ${vendor_bdfs[$sv]# }"
-        i=$((i + 1))
-    done
-    n=${#candidates[@]}
-    while :; do
-        read -rp "Pick one [1-$n, default 1]: " choice
-        choice="${choice:-1}"
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            break
-        fi
-        echo "  invalid — enter a number between 1 and $n"
-    done
-    SUBSYSTEM_VENDOR="${candidates[$((choice - 1))]}"
-fi
-MEMBER_BDFS="${vendor_bdfs[$SUBSYSTEM_VENDOR]# }"
-echo "    members: $MEMBER_BDFS"
-echo "    subsystem_vendor: $SUBSYSTEM_VENDOR"
+. "$SRC_DIR/scripts/lib/members.sh"
+detect_members
+echo "    members ($BIND_MODE): $MEMBER_BDFS"
+[ -n "$SUBSYSTEM_VENDOR" ] && echo "    subsystem_vendor: $SUBSYSTEM_VENDOR"
 echo
 
 echo "==> [3/8] building rcraid.ko against live kernel $(uname -r)"
@@ -183,7 +136,7 @@ for bdf in $MEMBER_BDFS; do
 done
 
 insmod "$SRC_DIR/rcraid.ko" \
-    enable_writes=1 "safe_subsys_vendor=$SUBSYSTEM_VENDOR" 2>&1 \
+    enable_writes=1 "$(member_filter_option)" 2>&1 \
     | sed 's/^/    /' || {
     echo "insmod failed — see dmesg" >&2
     dmesg | tail -20 >&2
@@ -412,7 +365,7 @@ mkdir -p "$TARGET/tmp/rcraid-pkg"
 cp -r "$SRC_DIR/packaging" "$TARGET/tmp/rcraid-pkg/"
 
 # Build the in-target install script.  We do it here rather than copying a
-# separate file in so all variables (subsystem_vendor, family, kver) are
+# separate file in so all variables (family, kver) are
 # baked at the call site — no parsing inside the chroot.
 cat > "$TARGET/tmp/rcraid-in-target.sh" <<EOF
 #!/bin/bash
@@ -421,7 +374,6 @@ set -euo pipefail
 PKG_NAME="$PKG_NAME"
 PKG_VERSION="$PKG_VERSION"
 TARGET_KVERS="$TARGET_KVERS"
-SUBSYSTEM_VENDOR="$SUBSYSTEM_VENDOR"
 TARGET_FAMILY="$TARGET_FAMILY"
 SRC_DIR="/usr/src/\${PKG_NAME}-\${PKG_VERSION}"
 PKG_DIR="/tmp/rcraid-pkg/packaging"
@@ -458,16 +410,10 @@ for kver in \$TARGET_KVERS; do
     dkms install -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$kver" --force
 done
 
-echo "    installing udev rule, modprobe drop-in, bind helper"
+# udev rule + modprobe drop-in were rendered into the target by the host
+# side (render_member_config) before this chroot ran.
+echo "    installing bind helper"
 install -m 0755 "\$PKG_DIR/sbin/rcraid-bind" /usr/sbin/rcraid-bind
-sed "s/@SUBSYSTEM_VENDOR@/\$SUBSYSTEM_VENDOR/g" \\
-    "\$PKG_DIR/udev/50-rcraid.rules.in" \\
-    > /etc/udev/rules.d/50-rcraid.rules
-chmod 0644 /etc/udev/rules.d/50-rcraid.rules
-sed "s/@SUBSYSTEM_VENDOR@/\$SUBSYSTEM_VENDOR/g" \\
-    "\$PKG_DIR/modprobe.d/rcraid.conf.in" \\
-    > /etc/modprobe.d/rcraid.conf
-chmod 0644 /etc/modprobe.d/rcraid.conf
 
 # On apt-based targets, keep kernel packages out of unattended-upgrades so
 # kernel updates (and the DKMS rebuild + initramfs regeneration they need)
@@ -501,6 +447,11 @@ else
 fi
 EOF
 chmod +x "$TARGET/tmp/rcraid-in-target.sh"
+
+# Render the member-specific udev rule + modprobe drop-in straight into the
+# target, from the detection done in Phase 1 — the in-target script and the
+# initramfs it regenerates pick them up from there.
+render_member_config "$TARGET" "$SRC_DIR/packaging"
 
 chroot "$TARGET" /tmp/rcraid-in-target.sh 2>&1 | sed 's/^/    /'
 

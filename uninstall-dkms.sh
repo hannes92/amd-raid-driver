@@ -94,7 +94,9 @@ fi
 udevadm control --reload-rules
 
 echo "==> Uninstall complete.  Reboot to fully release drives back to nvme,"
-echo "    or run:  for bdf in \$(lspci -d 1022:b000 -D | awk '{print \$1}'); do"
-echo "                echo > /sys/bus/pci/devices/\$bdf/driver_override"
-echo "                echo \$bdf > /sys/bus/pci/drivers_probe"
+echo "    or run:  rmmod rcraid"
+echo "             for d in /sys/bus/pci/devices/*; do"
+echo "                 [ \"\$(cat \$d/driver_override)\" = rcbottom ] || continue"
+echo "                 echo > \$d/driver_override"
+echo "                 basename \$d > /sys/bus/pci/drivers_probe"
 echo "             done"

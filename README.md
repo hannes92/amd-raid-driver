@@ -55,12 +55,13 @@ NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
 |--------|-----------|--------|
 | `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 + RAID1 read/write, boot-from-array validated** |
 | `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⚙️ Claimed but stubbed — not yet implemented |
-| native NVMe IDs (class `0108`) | X399 / Threadripper 1000–2000 NVMe RAID | 🔬 In progress — Windows 9.3.0 driver analyzed (same format and data path), member binding not yet implemented |
+| native NVMe IDs (class `0108`) | X399 / Threadripper 1000–2000 NVMe RAID | ✅ **RAID0 read/write validated** (4 members, mixed vendors); auto-bind by RAIDCore metadata — boot-from-array not yet validated |
 
 > **X399 note:** on 1st/2nd-gen Threadripper the NVMe members keep their
-> own vendor/device IDs in RAID mode instead of appearing as `1022:B000`,
-> so the driver does not bind them automatically yet. See
-> [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md#platform-delta-x399-package-930000266-1st2nd-gen-threadripper).
+> own vendor/device IDs in RAID mode instead of appearing as `1022:B000`.
+> The installers find them by the RAIDCore metadata on the drives and
+> only ever bind those. See [INSTALL.md](INSTALL.md#x399-1st2nd-gen-threadripper)
+> and [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md#platform-delta-x399-package-930000266-1st2nd-gen-threadripper).
 
 > **Heads-up for RAID1 users:** degraded mode and resync work — a member
 > failure (or hot-unplug) keeps the volume serving from the surviving

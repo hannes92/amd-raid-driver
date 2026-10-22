@@ -488,16 +488,29 @@ The Linux driver uses only standard NVMe admin opcodes and none of the
 code `B000` only selects BAR0 (`rc_bottom.c`), which the existing
 `allow_foreign_nvme` path already does for native-ID controllers.
 
-### What X399 support still needs
+### Hardware validation (2026-10-22)
 
-1. **Member binding.** In RAID mode the stock `nvme` driver claims every
-   drive first. Detect members by reading LBA `0x5000` from each
-   `/dev/nvmeXn1` for the `RAIDCore` magic while `nvme` still owns them,
-   then move only those to `rcraid` via `driver_override` (with
-   `allow_foreign_nvme=1`). This keeps the OS disk safe by construction.
-2. **initramfs hook** variant of the same for boot-from-array.
-3. **Hardware validation** — everything above is static analysis; nothing
-   has run on an X399 RAID array yet.
+X399 board with a 4-member RAID0 (2× Samsung 970 EVO 500 GB + 2× Corsair
+Force MP510, 256 KiB stripe, 1861 GiB) created in the RAIDXpert2 BIOS
+utility, Fedora 44 live, kernel 6.19:
+
+- All four drives carry RAIDCore metadata; the same committed generation
+  (seq 14) is read from every member and decodes as DeviceType `0x1BF6`,
+  FirstCount 4 / SecondCount 1, chunk_index 3 — the 9.3.2 parser applies
+  unchanged.
+- Assembled via `driver_override` + `allow_foreign_nvme=1`; every sector of
+  two 64 MiB LBA-stamped regions (array start and end) was found on the
+  expected member at the expected physical LBA when read back through the
+  stock `nvme` driver (262144 / 262144).
+- fio, 1 MiB QD32: 9.7 GB/s write, 13.2 GB/s read on freshly written data
+  (≈97 % of the members' combined raw throughput).
+- udev auto-bind (`rcraid-bind --disk`, RAIDCore re-check) brings
+  `/dev/rcraid0` up from the namespace add events alone and leaves
+  non-members untouched.
+
+Still open: boot-from-array on X399 (the dracut/initramfs-tools images carry
+the rule, helper and `dd`, but no install has been booted yet), and RAID1 on
+X399.
 
 ---
 
