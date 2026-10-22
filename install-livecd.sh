@@ -337,7 +337,9 @@ trap 'umount -R "$TARGET" 2>/dev/null || true' EXIT
 
 ESP_DEV=""
 for sub in /boot /boot/efi; do
-    fs_line=$(awk -v sub="$sub" '$2==sub && $1 !~ /^#/ {print; exit}' "$TARGET/etc/fstab" 2>/dev/null || true)
+    # Not `-v sub=`: sub is a gawk builtin, so gawk dies on it and every
+    # lookup came back empty — /boot was never mounted.
+    fs_line=$(awk -v mp="$sub" '$2==mp && $1 !~ /^#/ {print; exit}' "$TARGET/etc/fstab" 2>/dev/null || true)
     [ -n "$fs_line" ] || continue
     fs_spec=$(echo "$fs_line" | awk '{print $1}')
     case "$fs_spec" in
@@ -350,6 +352,12 @@ for sub in /boot /boot/efi; do
         echo "    mounting $sub from $fs_dev"
         mount "$fs_dev" "$TARGET$sub"
         if [ "$sub" = /boot/efi ]; then ESP_DEV="$fs_dev"; fi
+    else
+        # Carrying on would write the initramfs into the rootfs's /boot
+        # directory, which the real /boot mount hides at boot.
+        echo "target fstab has $sub on '$fs_spec' but it doesn't resolve to a" >&2
+        echo "block device — refusing to install into an unmounted $sub." >&2
+        exit 1
     fi
 done
 
