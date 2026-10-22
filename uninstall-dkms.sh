@@ -68,6 +68,7 @@ done < <(dkms status "$PKG_NAME" 2>/dev/null \
 
 rm -f  /usr/sbin/rcraid-bind
 rm -f  /etc/udev/rules.d/50-rcraid.rules
+rm -f  /etc/udev/rules.d/61-rcraid-storage.rules
 rm -f  /etc/modprobe.d/rcraid.conf
 rm -f  /etc/apt/apt.conf.d/52-rcraid-kernel-hold
 

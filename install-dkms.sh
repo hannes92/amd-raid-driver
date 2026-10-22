@@ -142,6 +142,10 @@ echo
 echo "==> installing /usr/sbin/rcraid-bind"
 install -m 0755 "$SRC_DIR/packaging/sbin/rcraid-bind" /usr/sbin/rcraid-bind
 
+echo "==> installing /etc/udev/rules.d/61-rcraid-storage.rules"
+install -m 0644 "$SRC_DIR/packaging/udev/61-rcraid-storage.rules" \
+    /etc/udev/rules.d/61-rcraid-storage.rules
+
 echo "==> rendering /etc/udev/rules.d/50-rcraid.rules + /etc/modprobe.d/rcraid.conf"
 render_member_config "" "$SRC_DIR/packaging"
 
@@ -235,6 +239,7 @@ What's installed:
                  /lib/modules/\$(uname -r)/updates/dkms/rcraid.ko
   Bind helper    /usr/sbin/rcraid-bind
   udev rule      /etc/udev/rules.d/50-rcraid.rules
+                 /etc/udev/rules.d/61-rcraid-storage.rules
                  ($([ "$BIND_MODE" = b000 ] && echo "filters on subsystem_vendor=$SUBSYSTEM_VENDOR" || echo "X399: members $MEMBER_BDFS, RAIDCore-verified at bind"))
   modprobe conf  /etc/modprobe.d/rcraid.conf
                  (enable_writes=1, $(member_filter_option))

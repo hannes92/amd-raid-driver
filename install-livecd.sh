@@ -138,17 +138,44 @@ done
 # A re-run in the same live session finds rcraid already loaded (and the
 # members already pinned, which detect_members picks up); reload so the
 # freshly built module is the one serving the OS installer.
-if grep -q '^rcraid ' /proc/modules; then
-    rmmod rcraid || { echo "rcraid is loaded and busy — unmount /dev/rcraid0* first" >&2; exit 1; }
+_reuse_loaded=0
+if grep -q '^rcraid ' /proc/modules && ! rmmod rcraid 2>/dev/null; then
+    # A still-open OS installer holds the array from its own mount
+    # namespace, where findmnt in ours can't see it.
+    if pgrep -ax 'anaconda|calamares|ubiquity' >&2; then
+        echo "rcraid is busy: the OS installer above is still running —" >&2
+        echo "close it and re-run." >&2
+        exit 1
+    fi
+    # Otherwise something we can't name (a lazily-unmounted filesystem from
+    # an earlier run, a root process with the disk open) pins it.  The
+    # loaded module was built from this tree earlier in the session, so
+    # carry on with it rather than demanding a live-session reboot.
+    if [ ! -b /dev/rcraid0 ]; then
+        echo "rcraid is loaded and busy but /dev/rcraid0 is missing —" >&2
+        echo "reboot the live session and re-run." >&2
+        exit 1
+    fi
+    echo "    rcraid is busy and can't be reloaded; reusing the loaded module"
+    _reuse_loaded=1
 fi
 
-insmod "$SRC_DIR/rcraid.ko" \
-    enable_writes=1 "$(member_filter_option)" 2>&1 \
-    | sed 's/^/    /' || {
-    echo "insmod failed — see dmesg" >&2
-    dmesg | tail -20 >&2
-    exit 1
-}
+# Give /dev/rcraid0pN the by-uuid/by-partuuid links stock udev withholds
+# from rcraid* (see the rule).  /run so it lasts only for this live session.
+mkdir -p /run/udev/rules.d
+install -m 0644 "$SRC_DIR/packaging/udev/61-rcraid-storage.rules" \
+    /run/udev/rules.d/61-rcraid-storage.rules
+udevadm control --reload-rules 2>/dev/null || true
+
+if [ "$_reuse_loaded" = 0 ]; then
+    insmod "$SRC_DIR/rcraid.ko" \
+        enable_writes=1 "$(member_filter_option)" 2>&1 \
+        | sed 's/^/    /' || {
+        echo "insmod failed — see dmesg" >&2
+        dmesg | tail -20 >&2
+        exit 1
+    }
+fi
 
 # Trigger probe for each member after the module is loaded.
 for bdf in $MEMBER_BDFS; do
@@ -239,6 +266,11 @@ fi
 echo
 
 echo "==> [6/8] locating the target rootfs on /dev/rcraid0"
+
+# Re-probe the array so the by-uuid links reflect what the installer wrote;
+# the fstab lookups below resolve UUID=/PARTUUID= through them.
+udevadm trigger --action=change --subsystem-match=block \
+    --sysname-match='rcraid*' --settle 2>/dev/null || true
 
 # Probe each partition read-only and find the one that looks like a Linux root
 # (has /etc/os-release or /usr/lib/os-release).  Skip swap, EFI, etc.
@@ -432,8 +464,10 @@ done
 
 # udev rule + modprobe drop-in were rendered into the target by the host
 # side (render_member_config) before this chroot ran.
-echo "    installing bind helper"
+echo "    installing bind helper + storage udev rule"
 install -m 0755 "\$PKG_DIR/sbin/rcraid-bind" /usr/sbin/rcraid-bind
+install -m 0644 "\$PKG_DIR/udev/61-rcraid-storage.rules" \\
+    /etc/udev/rules.d/61-rcraid-storage.rules
 
 # On apt-based targets, keep kernel packages out of unattended-upgrades so
 # kernel updates (and the DKMS rebuild + initramfs regeneration they need)
@@ -471,7 +505,7 @@ fi
 if command -v restorecon >/dev/null 2>&1 && [ -e /etc/selinux/config ]; then
     echo "    restoring SELinux labels"
     restorecon -RF /usr/sbin/rcraid-bind /etc/udev/rules.d/50-rcraid.rules \\
-        /etc/modprobe.d/rcraid.conf /usr/lib/dracut/modules.d/95rcraid \\
+        /etc/udev/rules.d/61-rcraid-storage.rules /etc/modprobe.d/rcraid.conf /usr/lib/dracut/modules.d/95rcraid \\
         "\$SRC_DIR" /lib/modules /boot 2>/dev/null || true
 fi
 EOF
@@ -514,7 +548,9 @@ ESP_MNT="$TARGET/boot/efi"
 if [ -z "${ESP_DEV:-}" ]; then
     for _p in /dev/rcraid0p*; do
         [ -b "$_p" ] || continue
-        if [ "$(blkid -o value -s PARTTYPE "$_p" 2>/dev/null || true)" = \
+        # PART_ENTRY_TYPE needs a low-level probe (-p); plain blkid never
+        # reports the GPT type GUID.
+        if [ "$(blkid -p -o value -s PART_ENTRY_TYPE "$_p" 2>/dev/null || true)" = \
              "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]; then
             ESP_DEV="$_p"
             break
@@ -530,6 +566,7 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    no ESP with an EFI/ directory found — skipping."
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
+    EFI_SKIPPED=1
 else
     # 1) Removable-media fallback loader.  Discover the VENDOR loader, and
     #    prefer the TARGET distro's own dir (EFI/$target_os) first.  This
@@ -795,9 +832,16 @@ cat <<EOF
   /dev/rcraid0pN is configured to boot off the AMD-RAID array.
   rcraid is installed via DKMS so it rebuilds on kernel updates.
   An initramfs hook makes the array available before pivot_root.
+$(if [ -n "${EFI_SKIPPED:-}" ]; then cat <<'SKIP'
+  WARNING: step 8 found no ESP, so NO boot entry or \EFI\BOOT
+  fallback was installed.  Fix that before rebooting (see above).
+SKIP
+else cat <<'OK'
   A UEFI boot entry + \EFI\BOOT\BOOTX64.EFI fallback were installed
   so the firmware can find the array even if the installer's own
   boot entry didn't stick.
+OK
+fi)
 
   You can now reboot:
 
