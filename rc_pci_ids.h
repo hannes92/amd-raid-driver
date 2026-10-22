@@ -20,6 +20,12 @@
  * of these five PCI IDs depending on the controller variant — the
  * IDs themselves are not chipset-specific.
  *
+ * Exception: X399 (1st/2nd-gen Threadripper).  Its package (9.3.0.00266,
+ * "NVMe_CC" folder) binds NVMe by class code PCI\CC_010802 instead of
+ * DEV_B000 — the member drives keep their native vendor/device IDs in
+ * RAID mode.  Those are not in our bind table; see the X399 section of
+ * docs/REVERSE_ENGINEERING.md.
+ *
  * Class codes:
  *   CC_0104 = Mass Storage / RAID  → AHCI-style command path
  *   CC_0108 = Mass Storage / NVMe  → NVMe command path

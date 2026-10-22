@@ -414,6 +414,93 @@ same RAID-level magics (`0x1BF6/7/A/B`). All geometry conclusions hold for
 
 ---
 
+## Platform delta: X399 package 9.3.0.00266 (1st/2nd-gen Threadripper)
+
+The newest Windows RAID package AMD lists for X399 is
+`raid_windows_driver_930_00266.zip` (`DriverVer 03/10/2021,9.3.0.00266`).
+Analyzed 2026-10-22 with Ghidra 12.2 against the 9.3.2-00255 binaries
+(restored from `69738ee`). **Bottom line: the on-disk format and the NVMe
+data path match 9.3.2; what X399 needs is a different way of binding the
+member drives, not a different driver.**
+
+### X399 does not use `1022:B000`
+
+The package ships three driver sets whose `.sys` files are code-identical
+(only the PE checksum at `0x158`/`0x150` and the Authenticode blob differ —
+zero byte differences inside any section). Only the INF match lines differ:
+
+| Folder | `rcbottom.inf` NVMe line | ReadMe: platform |
+|---|---|---|
+| `NVMe_CC` | `PCI\CC_010802` (any NVMe controller) | **1st/2nd-gen Threadripper (X399)** |
+| `NVMe_DID` | `PCI\VEN_1022&DEV_B000&CC_0108` | 3rd-gen Threadripper (TRX40) |
+| `RAID_SATA` | — (SATA IDs only) | SATA-only RAID |
+
+All three also list the four SATA IDs (`7905`, `43BD`, `7916`, `7917`).
+So on X399 the member NVMe drives keep their **native** vendor/device IDs in
+RAID mode, and Windows' `rcbottom` takes them over by class code. Our
+`rc_bottom_pci_tbl` only matches `B000`, so nothing binds on X399 by itself.
+
+| Binary (`NVMe_CC`) | SHA256 | Size |
+|---|---|---|
+| `rcraid.sys` | `628798fb…` | 548,040 B |
+| `rcbottom.sys` | `96736e11…` | 90,312 B |
+| `rccfg.sys` | `39ee79ad…` | — |
+
+### rcraid.sys: format and geometry unchanged
+
+Function matching (`scripts/ghidra/match_builds.py`: normalized-body hash →
+referenced-string set → call-graph propagation → fuzzy ≥ 0.85) paired 1214 of
+1372 9.3.2 functions. Everything the Linux driver was built from:
+
+| 9.3.2 function | Role | 9.3.0 |
+|---|---|---|
+| `RC_CheckMetaData` (`0x140063814`) | magic / version `0x30000` @ `+0x2C` / checksum | identical |
+| `RC_CheckConfigCommit`, `RC_CheckConfigPacket` | commit / packet checksums | identical |
+| `RC_BuildConfigMetadataFromRing` (`0x140019fb8`) | ring walk, tags `0x25BC`/`0x25BD` | identical |
+| `FUN_140018444` | on-disk LD packet → in-memory LD | identical |
+| `FUN_14001c674` | DeviceType → per-level I/O handlers | identical |
+| `FUN_1400121d0` → `0x140012430` | chunk_index → stripe size | same ladder (`2→0x100`, `3→0x200`, else `0x80`), same on-disk offsets |
+| RAID0 / RAID1 / span LBA mappers (`0x14002af44..0x14002bfbc`) | member + LBA math | semantically equivalent (inverted branches, same constants `+0x24`, `+0x14`, `+0x600`, `0x1d8`, `0xb0`) |
+| `RC_ReadMetaData`, `RC_ReadMBR`, `RC_ReadConfig` | config read I/O | in-memory offsets only |
+
+The recurring differences are all in-memory: the IOC struct is 4 bytes larger
+in 9.3.2 (`+0x3a0→0x3a4`, `+0x230→0x234`, request `+0x254→600`), a few tables
+grew (`0x10→0x18` loop bounds, `& 0x1f→& 0x3f` masks), and the version string.
+
+### rcbottom.sys: same NVMe path, 9.3.2 is a superset
+
+The callback-table installer (`0x140007664` in 9.3.0, `FUN_140007d40` in 9.3.2)
+makes the same decision: the four SATA IDs → AHCI (1), else
+`CC_010802` → NVMe (2), else stub (99). So X399's native-ID drives take exactly
+the `nvme.c` path that `B000` takes on TRX40/50. Slot-by-slot (9.3.0 vtable
+base is `devExt+0x1a800`):
+
+| Slot | 9.3.0 vs 9.3.2 |
+|---|---|
+| Cleanup, Disable, Enable/resume, State getter | identical |
+| Cmd submit | same SQE build (opcode byte, `nsid` = `a<<16 \| b&0xffff`, `(tail+1) % depth` doorbell); request struct re-laid out |
+| Queue/CR init | same `CC = 0x460000`, `CAP.TO × 5` timeout; 9.3.2 adds an 8-entry per-device table (stride `0xe`), a CAP == all-ones "gone" check, a 16-vs-10 limit and a larger queue-memory stride |
+| Primary dispatch | 9.3.2 accepts one extra request type (`0xc`) |
+| Status update (`+0x68`) | **9.3.2 only** — drive-LED pattern updater (`0x100..0x103`), unused by Linux |
+
+The Linux driver uses only standard NVMe admin opcodes and none of the
+9.3.2-only additions, so nothing in the data path depends on `B000`. In our
+code `B000` only selects BAR0 (`rc_bottom.c`), which the existing
+`allow_foreign_nvme` path already does for native-ID controllers.
+
+### What X399 support still needs
+
+1. **Member binding.** In RAID mode the stock `nvme` driver claims every
+   drive first. Detect members by reading LBA `0x5000` from each
+   `/dev/nvmeXn1` for the `RAIDCore` magic while `nvme` still owns them,
+   then move only those to `rcraid` via `driver_override` (with
+   `allow_foreign_nvme=1`). This keeps the OS disk safe by construction.
+2. **initramfs hook** variant of the same for boot-from-array.
+3. **Hardware validation** — everything above is static analysis; nothing
+   has run on an X399 RAID array yet.
+
+---
+
 ## Debunked theories (do not re-investigate)
 
 Each wasted significant effort in the 2024 analysis round. They are wrong; the
@@ -529,4 +616,18 @@ with pyghidra.open_program(SYS, analyze=True) as api:
     addr = prog.getAddressFactory().getDefaultAddressSpace().getAddress(0x1400121d0)
     f = prog.getFunctionManager().getFunctionContaining(addr)
     print(dec.decompileFunction(f, 60, ConsoleTaskMonitor()).getDecompiledFunction().getC())
+```
+
+For a whole-binary cross-build diff (how the X399 9.3.0 comparison was made;
+Linux, Ghidra 12.2, one project per import so headless runs don't contend
+for the project lock):
+
+```sh
+G=~/tools/ghidra_12.2_PUBLIC/support/analyzeHeadless
+$G /tmp/gproj old -import rcraid_9.3.2.sys -overwrite \
+  -scriptPath scripts/ghidra -postScript DumpAll.java out/rcraid_932.c
+$G /tmp/gproj new -import rcraid_9.3.0.sys -overwrite \
+  -scriptPath scripts/ghidra -postScript DumpAll.java out/rcraid_930.c
+python3 scripts/ghidra/match_builds.py out/rcraid_932.c out/rcraid_930.c \
+  $(grep -rhoE 'FUN_14[0-9a-f]{7}' rc_*.c rc_*.h docs/ | sort -u)
 ```
